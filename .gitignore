@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# Runtime state written by the app (personal data, changes constantly)
+chats/
+snapshots.json
+schedules.json
+conversions.json
+
+# Thumbnail cache (regenerated automatically)
+.thumbs/
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

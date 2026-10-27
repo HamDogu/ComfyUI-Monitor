@@ -1,0 +1,8 @@
+{
+  "workflow_dirs": ["C:\\Users\\hamid\\Data\\ai\\ComfyUI_windows_portable_nvidia\\ComfyUI_windows_portable\\ComfyUI\\user\\default\\workflows", "C:\\Users\\hamid\\Downloads"],
+  "converted_workflow_dir": "C:\\Users\\hamid\\Data\\ai\\ComfyUI_windows_portable_nvidia\\ComfyUI_windows_portable\\ComfyUI\\user\\default\\workflows\\converted",
+  "auto_convert_workflows": true,
+  "asset_dirs": ["C:\\Users\\hamid\\Downloads", "C:\\Users\\hamid\\Data\\ai\\ComfyUI_windows_portable_nvidia\\ComfyUI_windows_portable\\ComfyUI\\input"],
+  "output_dirs": ["C:\\Users\\hamid\\Data\\ai\\ComfyUI_windows_portable_nvidia\\ComfyUI_windows_portable\\ComfyUI\\output"],
+  "ffmpeg_path": "C:\\Users\\hamid\\Data\\ai\\ffmpeg.exe"
+}
