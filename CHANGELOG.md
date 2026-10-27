@@ -7,6 +7,14 @@ incompatible changes. The running version is shown next to the title in the app 
 
 ## [Unreleased]
 
+## [6.2.0] - 2026-10-27
+
+### Added
+- **⟳ Restart** button next to the version: restarts the monitor on the PC to load updated code,
+  then reloads the page once the new copy answers. ComfyUI and its queue are not affected.
+- `start_monitor.bat` relaunches the app when it exits for a restart (exit code 3); run directly
+  with Python, the app starts a fresh copy of itself instead.
+
 ## [6.1.0] - 2026-10-27
 
 ### Added

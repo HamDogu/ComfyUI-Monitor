@@ -16,7 +16,9 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -63,6 +65,22 @@ def app_version():
 
 
 APP_VERSION, APP_BUILD = app_version()
+# The in-app Restart button: stop serving, then start_monitor.bat (or a fresh process) reruns us.
+RESTART = threading.Event()
+RESTART_EXIT_CODE = 3
+SERVER = None
+STARTED = time.time()
+
+
+def wait_for_port_free(port, seconds=15):
+    """Windows lets two servers bind one port, so a restarted copy waits for the old one to close."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            socket.create_connection(('127.0.0.1', port), timeout=0.5).close()
+        except OSError:
+            return
+        time.sleep(0.3)
 # UI/canvas workflows are converted to API format and saved here (mirroring their relative path).
 CONVERTED_DIR = (Path(CONFIG['converted_workflow_dir']).expanduser().resolve()
                  if CONFIG.get('converted_workflow_dir')
@@ -1121,13 +1139,39 @@ NAV_JS = r'''
 '''
 
 
-VERSION_CSS = '.app-version{font-size:.72rem;font-weight:600;letter-spacing:0;color:#9fb6d2;border:1px solid #354966;border-radius:40px;padding:3px 8px;vertical-align:middle;margin-left:6px;white-space:nowrap}'
+RESTART_JS = '''
+(()=>{
+ const button=document.getElementById('app-restart');if(!button)return;
+ const wait=ms=>new Promise(done=>setTimeout(done,ms));
+ const reset=()=>{button.disabled=false;button.textContent='⟳ Restart';};
+ button.onclick=async()=>{
+  if(!confirm('Restart Comfy Mobile on the PC to load the latest code? ComfyUI and its queue keep running.'))return;
+  button.disabled=true;button.textContent='Restarting…';
+  let old;
+  try{
+   const r=await fetch('/api/restart',{method:'POST',credentials:'same-origin',
+    headers:{'X-Monitor-Token':document.querySelector('meta[name="monitor-token"]').content}});
+   const data=await r.json();if(!r.ok||data.error)throw Error(data.error||'HTTP '+r.status);old=data.started;
+  }catch(e){reset();alert('Restart failed: '+e.message);return;}
+  // Reload once a server answers that started after this request (the old one may linger briefly).
+  for(const until=Date.now()+60000;Date.now()<until;){
+   await wait(1000);
+   try{const r=await fetch('/api/version',{cache:'no-store',credentials:'same-origin'});
+    if(r.ok&&(await r.json()).started!==old){location.reload();return;}}catch(e){}
+  }
+  reset();alert('The monitor has not come back after a minute. Check its window on the PC.');
+ };
+})();
+'''
+VERSION_CSS = '.app-restart{font:inherit;font-size:.72rem;font-weight:600;letter-spacing:0;color:#d7e6f8;background:#1b2a3d;border:1px solid #354966;border-radius:40px;padding:3px 9px;vertical-align:middle;cursor:pointer}.app-restart:disabled{opacity:.6;cursor:wait}.app-version{font-size:.72rem;font-weight:600;letter-spacing:0;color:#9fb6d2;border:1px solid #354966;border-radius:40px;padding:3px 8px;vertical-align:middle;margin-left:6px;white-space:nowrap}'
 
 
 def full_html():
     content = core.HTML.replace('</style>', CSS + '\n' + VERSION_CSS + '\n</style>')
     content = content.replace('◉ Comfy Monitor</h1>', '◉ Comfy Monitor <span class="app-version" id="app-version" title="'
                               + html.escape(APP_BUILD) + '">v' + html.escape(APP_VERSION) + '</span></h1>', 1)
+    content = content.replace('</span></h1>', '</span> <button type="button" id="app-restart" class="app-restart" '
+                              'title="Restart the monitor on the PC to load updated code">⟳ Restart</button></h1>', 1)
     content = content.replace('<footer>', '<footer>Comfy Mobile ' + html.escape(APP_BUILD) + ' · ', 1)
     content = content.replace('Read-only queue, history &amp; downloads · updates every 5 seconds',
                               'Home, job queue, workflow scheduling &amp; output browsing · updates every 5 seconds')
@@ -1137,7 +1181,7 @@ def full_html():
     content = content.replace('The dashboard is read-only.',
                               'The dashboard can queue and schedule workflows; secure its URL and access.')
     content = content.replace('</head>', f'<meta name="monitor-token" content="{WRITE_TOKEN}"></head>', 1)
-    scripts = '<script>' + NAV_JS + '</script><script src="/assets.js?v=7"></script><script src="/schedule.js?v=7"></script><script src="/outputs.js?v=7"></script><script src="/recent.js?v=8"></script><script src="/prompts.js?v=7"></script>'
+    scripts = '<script>' + NAV_JS + RESTART_JS + '</script><script src="/assets.js?v=7"></script><script src="/schedule.js?v=7"></script><script src="/outputs.js?v=7"></script><script src="/recent.js?v=8"></script><script src="/prompts.js?v=7"></script>'
     content = content.replace('</body>', scripts + '</body>', 1)
     return content
 
@@ -1376,7 +1420,7 @@ class Handler(core.Handler):
                 return self.json_response(media.browse(OUTPUT_ROOTS, query.get('root', ['0'])[0],
                          query.get('path', [''])[0], query.get('offset', ['0'])[0], query.get('limit', ['120'])[0]))
             if parts.path == '/api/version':
-                return self.json_response({'version': APP_VERSION, 'build': APP_BUILD})
+                return self.json_response({'version': APP_VERSION, 'build': APP_BUILD, 'started': STARTED})
             if parts.path == '/api/output-file':
                 f = media.get_file(OUTPUT_ROOTS, query.get('root', ['0'])[0], query.get('path', [''])[0])
                 # Versioned (?v=mtime) URLs never change content, so the phone may keep them.
@@ -1511,6 +1555,13 @@ class Handler(core.Handler):
                     save_data(SNAPSHOTS_FILE, SNAPSHOTS)
                 return self.json_response({'id': sid})
             self.check_write()
+            if route == '/api/restart':
+                if SERVER is None:
+                    raise ValueError('Restart only works in the running monitor')
+                RESTART.set()
+                # Reply first; serve_forever() can only be stopped from another thread.
+                threading.Timer(0.5, SERVER.shutdown).start()
+                return self.json_response({'ok': True, 'started': STARTED})
             if route == '/api/chat':
                 data = json.loads(self.read_body(MAX_CHAT_BODY))
                 return self.stream_ndjson(lambda write: ollama.chat_turn(data, write))
@@ -1652,4 +1703,15 @@ if __name__ == '__main__':
     threading.Thread(target=LIVE.run, args=(core.COMFY_URL,), daemon=True, name='ComfyWebSocket').start()
     threading.Thread(target=media.warm_thumbnails, args=(OUTPUT_ROOTS + INPUT_ROOTS, CONFIG),
                      daemon=True, name='ThumbWarmer').start()
-    ThreadingHTTPServer(('127.0.0.1', core.PORT), Handler).serve_forever()
+    if os.environ.pop('COMFY_MONITOR_RESTARTED', ''):
+        wait_for_port_free(core.PORT)
+    SERVER = ThreadingHTTPServer(('127.0.0.1', core.PORT), Handler)
+    SERVER.serve_forever()
+    SERVER.server_close()
+    if RESTART.is_set():
+        print('Restarting to load the latest code ...')
+        if os.environ.get('COMFY_MONITOR_LAUNCHER'):
+            raise SystemExit(RESTART_EXIT_CODE)  # start_monitor.bat starts us again.
+        # Run directly: start a fresh copy in this console, which waits for the port.
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]], cwd=BASE,
+                         env=dict(os.environ, COMFY_MONITOR_RESTARTED='1'))

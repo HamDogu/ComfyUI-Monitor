@@ -115,7 +115,7 @@ py -3 release.py minor   # new features 6.1.0 -> 6.2.0
 py -3 release.py major   # big changes  6.1.0 -> 7.0.0
 ```
 
-It bumps `VERSION`, dates the changelog, commits everything and tags `vX.Y.Z`. Restart the monitor to serve the new version. Your chats, schedules, snapshots and thumbnail cache are git-ignored.
+It bumps `VERSION`, dates the changelog, commits everything and tags `vX.Y.Z`. Then tap **⟳ Restart** next to the version in the app (or close the monitor window and run `start_monitor.bat` again) to serve the new code. Your chats, schedules, snapshots and thumbnail cache are git-ignored.
 
 ## 7. Testing and source files
 
