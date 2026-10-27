@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
@@ -35,6 +36,10 @@ from urllib.request import Request, urlopen
 COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
 PORT = int(os.environ.get("MONITOR_PORT", "8765"))
 HISTORY_LIMIT = max(1, min(150, int(os.environ.get("HISTORY_LIMIT", "60"))))
+SLOW_REQUEST = 3  # Seconds; slower requests are printed to the console to help find hangs.
+# Streams, downloads, uploads and chat replies are expected to take a while.
+LONG_ROUTES = ("/api/file", "/api/zip", "/api/output-file", "/api/asset-file", "/api/upload",
+               "/api/chat", "/api/prompt/rewrite", "/api/history.json")
 MAX_ARCHIVE_FILES = 120
 MAX_ARCHIVE_SIZE = 2 * 1024 ** 3  # Building ZIPs uses temporary disk space; save >2 GiB files individually.
 IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".avif", ".apng")
@@ -550,6 +555,18 @@ class Handler(BaseHTTPRequestHandler):
         return self.reply(405, b"Read-only dashboard. Changes to jobs are disabled.", "text/plain")
 
     do_PUT = do_DELETE = do_PATCH = do_POST
+
+    def handle_one_request(self):
+        started = time.monotonic()
+        try:
+            super().handle_one_request()
+        except ConnectionError:
+            # The browser gave up on this request (page reloaded, folder changed, app backgrounded).
+            self.close_connection = True
+        elapsed = time.monotonic() - started
+        route = urlsplit(getattr(self, "path", "") or "").path
+        if elapsed > SLOW_REQUEST and route and not route.startswith(LONG_ROUTES):
+            print(f"[{time.strftime('%H:%M:%S')}] Slow request: {self.command} {route} took {elapsed:.1f}s", flush=True)
 
     def log_message(self, format, *args):
         pass

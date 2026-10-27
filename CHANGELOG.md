@@ -7,10 +7,20 @@ incompatible changes. The running version is shown next to the title in the app 
 
 ## [Unreleased]
 
+## [6.2.1] - 2026-10-27
+
 ### Changed
 - README rewritten for GitHub: features, requirements, installation, configuration, updating.
   Detailed tab guide, troubleshooting and older history moved to `docs/USER_GUIDE.md`.
 - `config.json` is no longer tracked; copy `config.example.json` to create it.
+
+### Fixed
+- A request the phone cancels (page reload, folder change, app in the background) no longer
+  prints a `ConnectionAbortedError` traceback in the monitor window.
+
+### Added
+- Requests that take over 3 seconds are logged in the monitor window ("Slow request: ..."), to
+  show what is slow when the app hangs. Downloads, streams, uploads and chat are not logged.
 
 ## [6.2.0] - 2026-10-27
 
