@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 
+# Your local settings (copy config.example.json to start)
+config.json
+
 # Runtime state written by the app (personal data, changes constantly)
 chats/
 snapshots.json

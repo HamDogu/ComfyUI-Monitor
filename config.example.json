@@ -1,0 +1,8 @@
+{
+  "workflow_dirs": ["C:/ComfyUI_windows_portable/ComfyUI/user/default/workflows"],
+  "converted_workflow_dir": "C:/ComfyUI_windows_portable/ComfyUI/user/default/workflows/converted",
+  "auto_convert_workflows": true,
+  "asset_dirs": ["C:/ComfyUI_windows_portable/ComfyUI/input"],
+  "output_dirs": ["C:/ComfyUI_windows_portable/ComfyUI/output"],
+  "ffmpeg_path": "C:/ffmpeg/bin/ffmpeg.exe"
+}

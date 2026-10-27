@@ -7,6 +7,11 @@ incompatible changes. The running version is shown next to the title in the app 
 
 ## [Unreleased]
 
+### Changed
+- README rewritten for GitHub: features, requirements, installation, configuration, updating.
+  Detailed tab guide, troubleshooting and older history moved to `docs/USER_GUIDE.md`.
+- `config.json` is no longer tracked; copy `config.example.json` to create it.
+
 ## [6.2.0] - 2026-10-27
 
 ### Added
