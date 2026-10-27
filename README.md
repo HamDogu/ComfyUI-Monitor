@@ -92,17 +92,32 @@ FFmpeg extracts thumbnails from recognized output files under configured `output
 | Queue ETA or preview missing | The workflow/node may not emit progress, or ComfyUI may restrict previews to the original client; whole-workflow ETAs aren't supplied. |
 | Workflow absent from schedule tab | Open/refresh ComfyUI PC tab with the optional bridge installed, or place a workflow JSON (UI or API format) in `workflow_dirs`. |
 | Converted workflow shows warnings | A node pack used by the workflow isn't installed, or a Use Everywhere node uses group/colour/regex rules the converter ignores. Install the pack, then tap **Re-convert**. |
+| Output browser or Media Assets slow / tab reloads | Make sure FFmpeg is found (startup banner): tiles use small cached thumbnails from `.thumbs/` and fall back to full-size originals without it. Check the phone reaches the PC directly with `tailscale ping <phone>` ("via 192.168.x.x" = direct; "via DERP" = slow relay). |
 | Cloudflare repeatedly asks you to log in | Use Tailscale Serve or a named tunnel protected by Cloudflare Access. The monitor cannot resolve external Cloudflare session expiry. |
 
 ## 5. Security and limitations
 
 - The monitor is **not** read-only overall: workflow runner/scheduler can submit GPU jobs. Only permit trusted clients via Tailscale or authenticated Cloudflare Access; no direct public exposure.
 - The file browser is read-only and constrained to configured roots; traversal paths, dotfiles, symlinks and unknown extensions are blocked. This doesn't make a publicly exposed workflow runner safe.
-- Video posters require FFmpeg; file browse may be slow with huge folders. Image uploads are limited to 40 MiB. Advanced custom nodes, LoRA stacks, nested workflow subgraphs, linked text inputs and unusual video output nodes may need tailored parsing.
+- Thumbnails and video posters require FFmpeg. They are cached in `.thumbs/` (capped at 20,000 files, safe to delete). Image uploads are limited to 40 MiB. Advanced custom nodes, LoRA stacks, nested workflow subgraphs, linked text inputs and unusual video output nodes may need tailored parsing.
 - Scheduled jobs require the monitor, ComfyUI and PC to remain running. Every-24-hour recurrence is not timezone/DST aware. The browser must be online when accessing remote pages, not for previously stored scheduled execution.
 - Python app's internal `/api/state` polling is normally every five seconds. Output browsing refreshes when necessary rather than on every tab switch.
 
-## 6. Testing and source files
+## 6. Versions and git
+
+The app version lives in `VERSION` and is shown next to the title (tap-and-hold/hover shows the git build) and at `/api/version`. A `+dirty` or `+N-gHASH` suffix means the running code has changes that are not in a release yet. History is in `CHANGELOG.md`; each release is a git tag (`git tag` lists them, `git checkout v6.0.0` goes back to one).
+
+To release: note your changes under `## [Unreleased]` in `CHANGELOG.md`, then run
+
+```
+py -3 release.py patch   # fixes        6.1.0 -> 6.1.1
+py -3 release.py minor   # new features 6.1.0 -> 6.2.0
+py -3 release.py major   # big changes  6.1.0 -> 7.0.0
+```
+
+It bumps `VERSION`, dates the changelog, commits everything and tags `vX.Y.Z`. Restart the monitor to serve the new version. Your chats, schedules, snapshots and thumbnail cache are git-ignored.
+
+## 7. Testing and source files
 
 - **15 Python integration/browser tests passed**, including all existing v4/v5 API tests, duration parsing, output path restrictions, queue telemetry, FFmpeg thumbnail extraction when available, and a simulated Chromium mobile UI test.
 - The mobile test verified Home → Queue → Planner → Output Browser → Home, shared browser location, collapsed/revealed recent downloads, and that navigation still responds **without the optional external JS files**.

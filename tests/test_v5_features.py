@@ -58,6 +58,7 @@ class V5Tests(unittest.TestCase):
         cls.app=ThreadingHTTPServer(('127.0.0.1',0),m.Handler)
         cls.base=f'http://127.0.0.1:{cls.app.server_port}'
         m.OUTPUT_ROOTS[:]=[output]
+        media.THUMB_DIR=cls.root/'thumbs'
         cls.comfy=ThreadingHTTPServer(('127.0.0.1',0),MockComfy)
         m.core.COMFY_URL=f'http://127.0.0.1:{cls.comfy.server_port}'
         threading.Thread(target=cls.app.serve_forever,daemon=True).start()
@@ -102,7 +103,7 @@ class V5Tests(unittest.TestCase):
             # Dynamic card labels are in core HTML's JavaScript.
             self.assertIn(content,html)
         js=self.get('/outputs.js').read().decode()
-        self.assertIn('output-poster',js)
+        self.assertIn('output-thumb',js)
         self.assertIn('output-file',js)
 
     def test_queue_live_data_without_fabricating_eta(self):
@@ -137,6 +138,40 @@ class V5Tests(unittest.TestCase):
         shutil.copyfile(file,m.OUTPUT_ROOTS[0]/'example.mp4')
         with self.get('/api/job-poster?job=run-2&node=7&kind=gifs&index=0') as r:
             self.assertTrue(r.read().startswith(b'\xff\xd8'))
+
+
+    def test_image_thumbnail_is_small_cached_and_cacheable(self):
+        ffmpeg=media.ffmpeg_executable(m.CONFIG)
+        if not ffmpeg:self.skipTest('FFmpeg unavailable')
+        big=m.OUTPUT_ROOTS[0]/'big.png'
+        subprocess.run([ffmpeg,'-hide_banner','-loglevel','error','-f','lavfi','-i','testsrc=s=1600x1200',
+                        '-frames:v','1','-y',str(big)],check=True,timeout=20,capture_output=True)
+        with self.get('/api/output-thumb?root=0&path=big.png&v=1') as r:
+            thumb=r.read()
+            self.assertEqual(r.headers['Content-Type'],'image/jpeg')
+            self.assertIn('max-age',r.headers['Cache-Control'])
+        self.assertTrue(thumb.startswith(b'\xff\xd8'))
+        self.assertLess(len(thumb),big.stat().st_size)
+        self.assertEqual(media.cached_thumbnail(big),thumb)
+        with self.get('/api/output-thumb?root=0&path=big.png') as r:
+            self.assertEqual(r.headers['Cache-Control'],'no-store')
+
+    def test_assets_listed_from_disk_when_comfy_unreachable(self):
+        url=m.core.COMFY_URL
+        m.core.COMFY_URL='http://127.0.0.1:9'
+        try:
+            data=m.media_assets('generated',0,60,'output 1')
+        finally:
+            m.core.COMFY_URL=url
+        self.assertTrue(data['stale'])
+        self.assertEqual([i['file'] for i in data['items']],['inbetween/output 1.png'])
+        with self.get('/api/asset-file?type=output&file='+urllib.parse.quote('inbetween/output 1.png')) as r:
+            self.assertEqual(r.read(),b'IMG')
+
+    def test_version_shown(self):
+        version=(Path(m.__file__).parent/'VERSION').read_text().strip()
+        self.assertEqual(json.load(self.get('/api/version'))['version'],version)
+        self.assertIn('id="app-version"',self.get('/').read().decode())
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

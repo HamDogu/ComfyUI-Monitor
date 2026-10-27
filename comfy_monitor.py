@@ -7,6 +7,7 @@ Bind localhost only; publish via Tailscale Serve or Cloudflare Access.
 import copy
 import datetime as dt
 import hashlib
+import html
 import io
 import json
 import mimetypes
@@ -15,6 +16,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -38,6 +40,29 @@ CONFIG = json.loads(CONFIG_FILE.read_text(encoding='utf-8')) if CONFIG_FILE.exis
 WORKFLOW_ROOTS = [Path(p).expanduser().resolve() for p in CONFIG.get('workflow_dirs', []) if p]
 ASSET_ROOTS = [Path(p).expanduser().resolve() for p in CONFIG.get('asset_dirs', []) if p]
 OUTPUT_ROOTS = [Path(p).expanduser().resolve() for p in CONFIG.get('output_dirs', []) if p]
+# ComfyUI's input folder, for serving Imported assets from disk; defaults to output's sibling.
+INPUT_ROOTS = ([Path(CONFIG['input_dir']).expanduser().resolve()] if CONFIG.get('input_dir')
+               else [r.parent / 'input' for r in OUTPUT_ROOTS if (r.parent / 'input').is_dir()])
+
+
+def app_version():
+    """('6.1.0', 'v6.1.0+dirty'): the VERSION file, plus git state when it differs from the tag."""
+    try:
+        version = (BASE / 'VERSION').read_text(encoding='utf-8').strip()
+    except OSError:
+        version = '0.0.0'
+    tag = 'v' + version
+    try:
+        described = subprocess.run(['git', 'describe', '--tags', '--dirty', '--always'], cwd=BASE,
+                                   capture_output=True, text=True, timeout=3, check=False,
+                                   creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        described = ''
+    extra = described[len(tag) + 1:] if described.startswith(tag + '-') else '' if described in ('', tag) else described
+    return version, tag + ('+' + extra if extra else '')
+
+
+APP_VERSION, APP_BUILD = app_version()
 # UI/canvas workflows are converted to API format and saved here (mirroring their relative path).
 CONVERTED_DIR = (Path(CONFIG['converted_workflow_dir']).expanduser().resolve()
                  if CONFIG.get('converted_workflow_dir')
@@ -56,6 +81,7 @@ LOCK = threading.RLock()
 MAX_JSON = 3 * 1024 * 1024
 MAX_IMAGE = 40 * 1024 * 1024
 MAX_MEDIA = 1024 * 1024 * 1024
+HOUR, WEEK = 3600, 7 * 24 * 3600  # Browser cache lifetimes for media that cannot change.
 IMAGE_TYPES = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
                '.webp': 'image/webp', '.gif': 'image/gif', '.bmp': 'image/bmp'}
 # Extensions the Fantastic H3 Media Loader accepts (its web_api.kind_for).
@@ -701,22 +727,64 @@ def asset_item(record, tag):
             'width': meta.get('width'), 'height': meta.get('height'), 'duration': meta.get('duration')}
 
 
+ASSET_LISTS = {}  # Last good ComfyUI answer per page, served while ComfyUI is busy.
+
+
 def media_assets(kind, offset=0, limit=60, search=''):
     """ComfyUI's Media Assets lists, newest first: generated (output) or imported (input) files."""
     tag = ASSET_TAGS.get(kind)
     if tag is None:
         raise ValueError('Choose generated or imported assets')
     offset, limit, search = max(0, int(offset)), min(max(1, int(limit)), 200), str(search)[:100]
+    key = (tag, offset, limit, search)
+    try:
+        result = comfy_assets(tag, offset, limit, search)
+    except (urllib.error.URLError, OSError, ValueError):
+        # ComfyUI is busy (a heavy job can stall its web server) or down: never wait on it.
+        return dict(ASSET_LISTS.get(key) or disk_assets(tag, offset, limit, search), stale=True)
+    if len(ASSET_LISTS) > 200:
+        ASSET_LISTS.clear()
+    ASSET_LISTS[key] = result
+    return result
+
+
+def disk_assets(tag, offset, limit, search):
+    """The same list read straight from ComfyUI's output or input folder."""
+    rows = []
+    for root in OUTPUT_ROOTS if tag == 'output' else INPUT_ROOTS:
+        for folder, dirs, names in os.walk(root):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            for name in names:
+                if name.startswith('.') or media_kind(name) == 'other' or search.lower() not in name.lower():
+                    continue
+                path = Path(folder) / name
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                rows.append((stat.st_mtime, {'name': name, 'file': path.relative_to(root).as_posix(), 'type': tag,
+                                             'media': media_kind(name), 'size': stat.st_size}))
+    rows.sort(key=lambda row: row[0], reverse=True)
+    return {'items': [item for _, item in rows[offset:offset + limit]],
+            'has_more': offset + limit < len(rows), 'next': offset + limit}
+
+
+def asset_disk_file(ref):
+    """The asset's file on disk under output_dirs / the input folder, or None."""
+    return media.related_job_file(OUTPUT_ROOTS if ref['type'] == 'output' else INPUT_ROOTS, dict(ref, type='output'))
+
+
+def comfy_assets(tag, offset, limit, search):
     params = {'tags_all': tag, 'limit': limit, 'offset': offset, 'sort': 'created_at', 'order': 'desc'}
     if search:
         params['name_contains'] = search
     try:
-        data = core.comfy_get('/api/assets?' + urllib.parse.urlencode(params))
+        data = core.comfy_get('/api/assets?' + urllib.parse.urlencode(params), timeout=5)
         items = [asset_item(r, tag) for r in data.get('assets') or [] if isinstance(r, dict)]
         return {'items': [i for i in items if i], 'has_more': bool(data.get('has_more')), 'next': offset + limit}
     except urllib.error.HTTPError:
         # Assets API disabled or an older ComfyUI: its flat folder listing instead.
-        names = [re.sub(r'\s*\[\w+\]$', '', n) for n in core.comfy_get('/internal/files/' + tag)
+        names = [re.sub(r'\s*\[\w+\]$', '', n) for n in core.comfy_get('/internal/files/' + tag, timeout=5)
                  if isinstance(n, str)]
         names = [n for n in names if search.lower() in n.lower() and media_kind(n) != 'other']
         return {'items': [{'name': n, 'file': n, 'type': tag, 'media': media_kind(n)}
@@ -1053,8 +1121,14 @@ NAV_JS = r'''
 '''
 
 
+VERSION_CSS = '.app-version{font-size:.72rem;font-weight:600;letter-spacing:0;color:#9fb6d2;border:1px solid #354966;border-radius:40px;padding:3px 8px;vertical-align:middle;margin-left:6px;white-space:nowrap}'
+
+
 def full_html():
-    content = core.HTML.replace('</style>', CSS + '\n</style>')
+    content = core.HTML.replace('</style>', CSS + '\n' + VERSION_CSS + '\n</style>')
+    content = content.replace('◉ Comfy Monitor</h1>', '◉ Comfy Monitor <span class="app-version" id="app-version" title="'
+                              + html.escape(APP_BUILD) + '">v' + html.escape(APP_VERSION) + '</span></h1>', 1)
+    content = content.replace('<footer>', '<footer>Comfy Mobile ' + html.escape(APP_BUILD) + ' · ', 1)
     content = content.replace('Read-only queue, history &amp; downloads · updates every 5 seconds',
                               'Home, job queue, workflow scheduling &amp; output browsing · updates every 5 seconds')
     start = content.index('<div class="stats">')
@@ -1210,13 +1284,20 @@ def state_data():
 
 
 class Handler(core.Handler):
-    server_version = 'ComfyMobile/6'
+    server_version = 'ComfyMobile/' + APP_VERSION
 
     def send_header(self, keyword, value):
         # Chat attachments and saved chat images are shown from data:/blob: URLs.
         if keyword == 'Content-Security-Policy':
             value = value.replace("img-src 'self'", "img-src 'self' data: blob:")
         return super().send_header(keyword, value)
+
+    def send_file(self, file, download):
+        # Saved outputs come straight off the disk, so a busy ComfyUI cannot slow them down.
+        disk = media.related_job_file(OUTPUT_ROOTS, file)
+        if disk is not None:
+            return media.send_local(self, disk, download, head=self.command == 'HEAD', cache_seconds=HOUR)
+        return super().send_file(file, download)
 
     def stream_ndjson(self, work):
         """Run work(write), sending each dict it writes as one line of NDJSON as it arrives.
@@ -1294,23 +1375,28 @@ class Handler(core.Handler):
                     raise ValueError('No output_dirs configured in config.json. Add the ComfyUI output folder path and restart.')
                 return self.json_response(media.browse(OUTPUT_ROOTS, query.get('root', ['0'])[0],
                          query.get('path', [''])[0], query.get('offset', ['0'])[0], query.get('limit', ['120'])[0]))
+            if parts.path == '/api/version':
+                return self.json_response({'version': APP_VERSION, 'build': APP_BUILD})
             if parts.path == '/api/output-file':
                 f = media.get_file(OUTPUT_ROOTS, query.get('root', ['0'])[0], query.get('path', [''])[0])
-                return media.send_local(self, f, query.get('dl', ['0'])[0] == '1')
-            if parts.path == '/api/output-poster':
+                # Versioned (?v=mtime) URLs never change content, so the phone may keep them.
+                return media.send_local(self, f, query.get('dl', ['0'])[0] == '1',
+                                        cache_seconds=WEEK if query.get('v') else 0)
+            if parts.path in ('/api/output-thumb', '/api/output-poster'):
                 f = media.get_file(OUTPUT_ROOTS, query.get('root', ['0'])[0], query.get('path', [''])[0])
-                if f.suffix.lower() not in media.VIDEO_EXT:
-                    raise ValueError('Not a video')
-                return self.reply(200, media.poster(f, CONFIG), 'image/jpeg')
-            if parts.path == '/api/job-poster':
+                if f.suffix.lower() not in media.THUMB_EXT:
+                    raise ValueError('No thumbnail for this file type')
+                return self.reply(200, media.thumbnail(f, CONFIG), 'image/jpeg',
+                                  cache=f'private, max-age={WEEK}' if query.get('v') else 'no-store')
+            if parts.path in ('/api/job-thumb', '/api/job-poster'):
                 record = core.get_job(query.get('job', [''])[0])
                 f = core.job_file(record, query)
-                if Path(f['filename']).suffix.lower() not in media.VIDEO_EXT:
-                    raise ValueError('Not a video')
+                if Path(f['filename']).suffix.lower() not in media.THUMB_EXT:
+                    raise ValueError('No thumbnail for this file type')
                 disk = media.related_job_file(OUTPUT_ROOTS, f)
                 if disk is None:
-                    raise ValueError('Video poster unavailable: configure output_dirs matching the ComfyUI output path')
-                return self.reply(200, media.poster(disk, CONFIG), 'image/jpeg')
+                    raise ValueError('Thumbnail unavailable: configure output_dirs matching the ComfyUI output path')
+                return self.reply(200, media.thumbnail(disk, CONFIG), 'image/jpeg', cache=f'private, max-age={HOUR}')
             if parts.path == '/api/live-preview':
                 ident = query.get('job', [''])[0]
                 if ident not in current_queue_ids():
@@ -1357,13 +1443,16 @@ class Handler(core.Handler):
                                                        query.get('limit', ['60'])[0], query.get('q', [''])[0]))
             if parts.path == '/api/asset-file':
                 ref = asset_reference(query.get('type', [''])[0], query.get('file', [''])[0])
+                disk = asset_disk_file(ref)
+                if disk is not None:  # Straight from disk: no waiting on a busy ComfyUI.
+                    return media.send_local(self, disk, query.get('dl', ['0'])[0] == '1', cache_seconds=HOUR)
                 return self.send_file(ref, query.get('dl', ['0'])[0] == '1')
-            if parts.path == '/api/asset-poster':
+            if parts.path in ('/api/asset-thumb', '/api/asset-poster'):
                 ref = asset_reference(query.get('type', [''])[0], query.get('file', [''])[0])
-                disk = media.related_job_file(OUTPUT_ROOTS, ref) if media_kind(ref['filename']) == 'video' else None
-                if disk is None:
-                    raise ValueError('Poster unavailable for this asset')
-                return self.reply(200, media.poster(disk, CONFIG), 'image/jpeg')
+                disk = asset_disk_file(ref)
+                if disk is None or disk.suffix.lower() not in media.THUMB_EXT:
+                    raise ValueError('Thumbnail unavailable for this asset')
+                return self.reply(200, media.thumbnail(disk, CONFIG), 'image/jpeg', cache=f'private, max-age={HOUR}')
             if parts.path == '/assets.js':
                 return self.reply(200, (BASE / 'assets.js').read_bytes(), 'text/javascript; charset=utf-8')
             if parts.path == '/api/local-image':
@@ -1545,7 +1634,7 @@ class Handler(core.Handler):
 
 if __name__ == '__main__':
     print('=' * 60)
-    print('Comfy Mobile v6 — Home, Queue, Schedule and Output Browser')
+    print(f'Comfy Mobile {APP_BUILD} — Home, Queue, Schedule and Output Browser')
     print('Local dashboard: http://127.0.0.1:' + str(core.PORT))
     print('ComfyUI: ' + core.COMFY_URL)
     print('Workflow folders:', [str(p) for p in WORKFLOW_ROOTS])
@@ -1561,4 +1650,6 @@ if __name__ == '__main__':
     if AUTO_CONVERT and CONVERTED_DIR:
         threading.Thread(target=auto_convert_loop, daemon=True, name='AutoConvert').start()
     threading.Thread(target=LIVE.run, args=(core.COMFY_URL,), daemon=True, name='ComfyWebSocket').start()
+    threading.Thread(target=media.warm_thumbnails, args=(OUTPUT_ROOTS + INPUT_ROOTS, CONFIG),
+                     daemon=True, name='ThumbWarmer').start()
     ThreadingHTTPServer(('127.0.0.1', core.PORT), Handler).serve_forever()

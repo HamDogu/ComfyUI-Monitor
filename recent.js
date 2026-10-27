@@ -17,7 +17,7 @@
   const shown=previewFiles(job,1)[0]; // largest video when the job saved several
   if(shown&&pic.test(shown.filename)){
    const link=el('a');link.href=fileUrl(job,shown,false);link.target='_blank';link.rel='noopener noreferrer';
-   const image=el('img');image.loading='lazy';image.alt=shown.filename;image.src=fileUrl(job,shown,false);link.append(image);media.append(link);
+   link.append(thumbImg(job,shown));media.append(link);
   }else if(shown)media.append(videoBox(job,shown));
   else media.append(el('div','file-icon',job.files.length?'📄':'∅'));
   const body=el('div','output-cardbody'),facts=el('div','recent-facts');

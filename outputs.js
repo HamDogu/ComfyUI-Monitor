@@ -5,13 +5,14 @@
  const pic=/\.(png|jpe?g|webp|gif|bmp|avif|apng|tif|tiff)$/i;
  function el(tag,cls,text){const node=document.createElement(tag);if(cls)node.className=cls;if(text!==undefined)node.textContent=text;return node;}
  function size(bytes){if(!Number.isFinite(bytes))return '';const unit=['B','KB','MB','GB','TB'];let n=bytes,i=0;while(n>=1024&&i<4){n/=1024;i++;}return (i?n.toFixed(1):n)+' '+unit[i];}
- function fileURL(item,download=false){return '/api/output-file?'+new URLSearchParams({root:current.root,path:item.path,dl:download?'1':'0'});}
- function thumbURL(item){return '/api/output-poster?'+new URLSearchParams({root:current.root,path:item.path});}
+ // v= (the file's mtime) lets the phone cache files and thumbnails until the file changes.
+ function fileURL(item,download=false){return '/api/output-file?'+new URLSearchParams({root:current.root,path:item.path,dl:download?'1':'0',v:item.modified});}
+ function thumbURL(item){return '/api/output-thumb?'+new URLSearchParams({root:current.root,path:item.path,v:item.modified});}
  function feedback(message,bad=false){const node=get('output-status');node.textContent=message;node.classList.toggle('error-text',bad);}
  async function load(reset=true){
   if(current.loading)return;
   current.loading=true;get('output-next').disabled=true;
-  if(reset){current.items=[];current.offset=0;get('output-grid').replaceChildren();}
+  if(reset){current.items=[];current.offset=0;clearGrid();}
   feedback('Loading folder…');
   try{
    const url='/api/outputs?'+new URLSearchParams({root:current.root,path:current.path,offset:current.offset,limit:120});
@@ -41,22 +42,37 @@
    crumb.type='button';crumb.onclick=()=>navigate(route);area.append(crumb);
   });
  }
- // Videos autoplay muted and looped. The file is only fetched once the card nears the
- // viewport, and playback pauses off-screen (including when the browser tab is hidden).
+ // Videos autoplay muted and looped, but only the first MAX_PLAYING on screen. A video is only
+ // fetched near the viewport and is unloaded again off-screen: every playing video holds a
+ // hardware decoder and buffers, and too many at once makes phones kill the browser tab.
+ const MAX_PLAYING=4,visible=new Set();
+ function unload(vid){if(vid.getAttribute('src')){vid.pause();vid.removeAttribute('src');vid.load();}}
+ function schedule(){
+  // Videos the user opened controls on keep their slot; the rest go top to bottom.
+  const order=[...visible].sort((a,b)=>(b.controls-a.controls)||(a.compareDocumentPosition(b)&Node.DOCUMENT_POSITION_FOLLOWING?-1:1));
+  order.forEach((vid,i)=>{
+   if(i<MAX_PLAYING){if(!vid.getAttribute('src'))vid.src=vid.dataset.src;vid.play().catch(()=>{});}
+   else unload(vid);
+  });
+ }
  const watcher='IntersectionObserver' in window?new IntersectionObserver(entries=>{
   for(const entry of entries){
-   const vid=entry.target;
-   if(entry.isIntersecting){if(!vid.src)vid.src=vid.dataset.src;vid.play().catch(()=>{});}
-   else if(!vid.paused)vid.pause();
+   if(entry.isIntersecting)visible.add(entry.target);
+   else{visible.delete(entry.target);unload(entry.target);}
   }
- },{rootMargin:'200px 0px'}):null;
+  schedule();
+ },{rootMargin:'150px 0px'}):null;
+ function clearGrid(){
+  if(watcher)watcher.disconnect();visible.clear();
+  const grid=get('output-grid');grid.querySelectorAll('video').forEach(unload);grid.replaceChildren();
+ }
  function makeVideo(item){
   const vid=el('video');vid.muted=true;vid.defaultMuted=true;vid.loop=true;vid.autoplay=true;
   vid.playsInline=true;vid.setAttribute('playsinline','');vid.setAttribute('muted','');
   vid.preload='none';vid.poster=thumbURL(item);vid.dataset.src=fileURL(item);
   vid.title=item.name+' · tap for controls';
   // Tap reveals native controls (unmute, seek, fullscreen) without stopping the loop.
-  vid.onclick=()=>{if(!vid.controls)vid.controls=true;};
+  vid.onclick=()=>{if(!vid.controls){vid.controls=true;schedule();}};
   vid.onerror=()=>vid.closest('.output-video-shell')?.classList.add('no-poster');
   if(watcher)watcher.observe(vid);else{vid.src=vid.dataset.src;vid.preload='auto';}
   return vid;
@@ -77,7 +93,9 @@
   const media=el('div','output-media');
   if(item.media==='image'){
    const link=el('a');link.href=fileURL(item);link.target='_blank';link.rel='noopener noreferrer';
-   const image=el('img');image.loading='lazy';image.alt=item.name;image.src=fileURL(item);link.append(image);media.append(link);
+   // A small cached thumbnail; tapping still opens the full-size original.
+   const image=el('img');image.loading='lazy';image.decoding='async';image.alt=item.name;image.src=thumbURL(item);
+   image.onerror=()=>{image.onerror=null;image.src=fileURL(item);};link.append(image);media.append(link);
   }else if(item.media==='video'){
    const shell=el('div','output-video-shell');shell.append(makeVideo(item));media.append(shell);
   }else media.append(el('div','file-icon','📄'));
@@ -90,7 +108,7 @@
   text.append(actions);box.append(media,text);return box;
  }
  function renderItems(){
-  const grid=get('output-grid');if(watcher)watcher.disconnect();grid.replaceChildren();
+  clearGrid();const grid=get('output-grid');
   const term=get('output-search').value.trim().toLowerCase();
   const shown=current.items.filter(row=>!term||row.name.toLowerCase().includes(term));
   if(!shown.length)grid.append(el('p','muted',term?'No matching items on this loaded page.':'This directory is empty.'));

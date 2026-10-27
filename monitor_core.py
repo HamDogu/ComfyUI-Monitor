@@ -99,6 +99,8 @@ function short(id){return String(id||'').slice(0,16)+'…';}
 function largestVideo(files){return files.filter(f=>vid.test(f.filename)).reduce((best,f)=>!best||(f.size||0)>(best.size||0)?f:best,null);}
 function previewFiles(job,limit){const v=largestVideo(job.files),pics=job.files.filter(f=>pic.test(f.filename));return (v?[v,...pics]:pics).slice(0,limit);}
 function fileUrl(job,f,download){return '/api/file?'+new URLSearchParams({job:job.id,node:f.node,kind:f.kind,index:String(f.index),dl:download?'1':'0'});}
+// Small JPEG for tiles; falls back to the full file where no thumbnail service exists.
+function thumbImg(job,f){const im=el('img');im.loading='lazy';im.decoding='async';im.alt=f.filename;im.src='/api/job-thumb?'+new URLSearchParams({job:job.id,node:f.node,kind:f.kind,index:String(f.index)});im.onerror=()=>{im.onerror=null;im.src=fileUrl(job,f,false);};return im;}
 function notify(message, auth=false){$('notice-text').textContent=message;$('notice').hidden=false;if(auth){pausePolling=true;$('connection').textContent='● Sign-in required';$('connection').className='down';}}
 function clearNotice(){$('notice').hidden=true;}
 function isAuthRedirect(r){return r.type==='opaqueredirect'||r.status===0||r.status===401||r.status===403||r.status>=300&&r.status<400;}
@@ -238,7 +240,7 @@ function renderGallery(history){
    if(!accordion.open||accordion.querySelector('.history-content'))return;
    const c=el('article','card history-content'),preview=el('div','preview');let added=0;
    for(const f of previewFiles(job,2)){const u=fileUrl(job,f,false);
-    if(pic.test(f.filename)){const a=el('a');a.href=u;a.target='_blank';a.rel='noopener noreferrer';const im=el('img');im.src=u;im.alt=f.filename;im.loading='lazy';a.append(im);preview.append(a);added++;}
+    if(pic.test(f.filename)){const a=el('a');a.href=u;a.target='_blank';a.rel='noopener noreferrer';a.append(thumbImg(job,f));preview.append(a);added++;}
     else if(vid.test(f.filename)){preview.append(videoBox(job,f));added++;}}
    if(!added)preview.append(el('div','no-preview','No image/video preview available'));
    const body=el('div','cardbody'),line=el('div','jobline');
@@ -277,8 +279,8 @@ document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh();
 </script></body></html>'''
 
 
-def comfy_get(route):
-    with urlopen(COMFY_URL + route, timeout=15) as response:
+def comfy_get(route, timeout=15):
+    with urlopen(COMFY_URL + route, timeout=timeout) as response:
         return json.load(response)
 
 
@@ -325,13 +327,22 @@ def collect_files(record):
     return result
 
 
+FINISHED_JOBS = {}  # Completed history records never change; keep them so files skip ComfyUI.
+
+
 def get_job(job_id):
     if not job_id or len(job_id) > 128 or any(ord(ch) < 32 for ch in job_id):
         raise ValueError("Invalid job ID")
+    if job_id in FINISHED_JOBS:
+        return FINISHED_JOBS[job_id]
     data = comfy_get("/history/" + quote(job_id, safe=""))
     record = data.get(job_id) if isinstance(data, dict) else None
     if not isinstance(record, dict):
         raise LookupError("Job not found in ComfyUI history")
+    if (record.get("status") or {}).get("completed"):
+        if len(FINISHED_JOBS) > 500:
+            FINISHED_JOBS.clear()
+        FINISHED_JOBS[job_id] = record
     return record
 
 
@@ -372,17 +383,17 @@ class ArchiveTooLarge(Exception):
 class Handler(BaseHTTPRequestHandler):
     server_version = "ComfyMonitor/3"
 
-    def base_headers(self):
+    def base_headers(self, cache="no-store"):
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'")
 
-    def reply(self, status, payload, content_type, attachment=None):
+    def reply(self, status, payload, content_type, attachment=None, cache="no-store"):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.base_headers()
+        self.base_headers(cache)
         if attachment:
             self.send_header("Content-Disposition", disposition(attachment))
         self.send_header("Content-Length", str(len(payload)))

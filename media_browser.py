@@ -1,6 +1,6 @@
-"""Read-only, constrained output-folder browser and FFmpeg poster renderer."""
-from collections import OrderedDict
+"""Read-only, constrained output-folder browser and FFmpeg thumbnail renderer."""
 from pathlib import Path
+import hashlib
 import mimetypes
 import os
 import re
@@ -12,10 +12,16 @@ import time
 OUTPUT_EXT = frozenset('.png .jpg .jpeg .webp .gif .bmp .avif .apng .tif .tiff .exr .hdr .mp4 .m4v .webm .mov .mkv .avi .mpg .mpeg .gif .wav .mp3 .ogg .flac .aac .m4a .json .txt .csv .zip .glb .gltf .obj .ply .stl .fbx .webp .srt'.split())
 VIDEO_EXT = frozenset('.mp4 .webm .mov .m4v .mkv .avi .mpg .mpeg'.split())
 IMAGE_EXT = frozenset('.png .jpg .jpeg .webp .gif .bmp .avif .apng .tif .tiff'.split())
-POSTERS = OrderedDict()
-CACHE_LOCK = threading.RLock()
-FFMPEG_LIMIT = threading.BoundedSemaphore(2)
-MAX_POSTERS = 160
+THUMB_EXT = (IMAGE_EXT | VIDEO_EXT) - {'.exr', '.hdr'}
+# Thumbnails persist on disk so they survive restarts and never need ComfyUI.
+THUMB_DIR = Path(__file__).resolve().parent / '.thumbs'
+THUMB_SIZE = 512
+MAX_THUMBS = 20000
+# Requests from the phone; the background warmer runs one extra FFmpeg of its own.
+FFMPEG_LIMIT = threading.BoundedSemaphore(3)
+# Thumbnails must never compete with ComfyUI for CPU time.
+LOW_PRIORITY = (getattr(subprocess, 'BELOW_NORMAL_PRIORITY_CLASS', 0) |
+                getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 
 
 def clean_rel(path, allow_empty=False):
@@ -124,37 +130,109 @@ def ffmpeg_executable(config):
     return configured if configured and Path(configured).is_file() else shutil.which('ffmpeg')
 
 
-def poster(file, config):
-    """Extract a single JPEG poster without serving or converting the entire video."""
+def thumb_path(file):
+    stat = file.stat()
+    key = f'{file}|{stat.st_mtime_ns}|{stat.st_size}'.encode('utf-8', 'surrogatepass')
+    return THUMB_DIR / (hashlib.sha1(key).hexdigest() + '.jpg')
+
+
+def cached_thumbnail(file):
+    """The thumbnail bytes if already rendered, else None."""
+    try:
+        return thumb_path(file).read_bytes()
+    except OSError:
+        return None
+
+
+def render_thumbnail(file, config, limit=FFMPEG_LIMIT, wait=6):
+    """Render one small JPEG for an image or video (first frame) into the disk cache."""
     ffmpeg = ffmpeg_executable(config)
     if not ffmpeg:
         raise FileNotFoundError('FFmpeg unavailable; configure ffmpeg_path or install it on PATH')
-    stat = file.stat()
-    cache_key = (str(file), stat.st_mtime_ns, stat.st_size)
-    with CACHE_LOCK:
-        if cache_key in POSTERS:
-            POSTERS.move_to_end(cache_key)
-            return POSTERS[cache_key]
-    if not FFMPEG_LIMIT.acquire(timeout=6):
+    if file.suffix.lower() not in THUMB_EXT:
+        raise ValueError('No thumbnail for this file type')
+    target = thumb_path(file)
+    if not limit.acquire(timeout=wait):
         raise TimeoutError('Thumbnail service is busy')
     try:
-        command = [str(ffmpeg), '-hide_banner', '-loglevel', 'error', '-nostdin', '-ss', '0.25',
-                   '-i', str(file), '-an', '-frames:v', '1', '-vf', 'scale=480:-2:force_original_aspect_ratio=decrease',
+        if target.is_file():  # Rendered by another request while this one waited.
+            return target.read_bytes()
+        seek = ['-ss', '0.25'] if file.suffix.lower() in VIDEO_EXT else []
+        command = [str(ffmpeg), '-hide_banner', '-loglevel', 'error', '-nostdin', '-threads', '2', *seek,
+                   '-i', str(file), '-an', '-frames:v', '1',
+                   '-vf', f"scale='min({THUMB_SIZE},iw)':'min({THUMB_SIZE},ih)':force_original_aspect_ratio=decrease",
                    '-f', 'image2pipe', '-vcodec', 'mjpeg', '-q:v', '5', 'pipe:1']
         try:
-            done = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=18, check=False)
+            done = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=18,
+                                  check=False, creationflags=LOW_PRIORITY)
         except (subprocess.TimeoutExpired, OSError) as exc:
             raise ValueError('FFmpeg thumbnail extraction timed out or could not start') from exc
         if done.returncode or not done.stdout.startswith(b'\xff\xd8') or len(done.stdout) > 3 * 1024 * 1024:
-            raise ValueError('FFmpeg could not extract a video frame (file may be incomplete or unsupported)')
-        with CACHE_LOCK:
-            POSTERS[cache_key] = done.stdout
-            POSTERS.move_to_end(cache_key)
-            while len(POSTERS) > MAX_POSTERS:
-                POSTERS.popitem(last=False)
+            raise ValueError('FFmpeg could not extract a frame (file may be incomplete or unsupported)')
+        THUMB_DIR.mkdir(exist_ok=True)
+        temp = target.with_suffix(f'.{threading.get_ident()}.tmp')
+        temp.write_bytes(done.stdout)
+        os.replace(temp, target)
         return done.stdout
     finally:
-        FFMPEG_LIMIT.release()
+        limit.release()
+
+
+def thumbnail(file, config):
+    return cached_thumbnail(file) or render_thumbnail(file, config)
+
+
+# Video posters predate image thumbnails; both now share the disk cache.
+poster = thumbnail
+
+
+def media_files(root, limit=5000):
+    """Thumbnail-able files under root, newest first."""
+    found = []
+    for folder, dirs, names in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        for name in names:
+            if name.startswith('.') or Path(name).suffix.lower() not in THUMB_EXT:
+                continue
+            path = Path(folder) / name
+            try:
+                if not path.is_symlink():
+                    found.append((path.stat().st_mtime, path))
+            except OSError:
+                continue
+    found.sort(key=lambda row: row[0], reverse=True)
+    return [path for _, path in found[:limit]]
+
+
+def prune_thumbnails():
+    try:
+        thumbs = sorted(THUMB_DIR.glob('*.jpg'), key=lambda f: f.stat().st_atime)
+    except OSError:
+        return
+    for stale in thumbs[:max(0, len(thumbs) - MAX_THUMBS)]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def warm_thumbnails(roots, config, interval=30):
+    """Background loop: pre-render thumbnails for new outputs so folders open instantly."""
+    own = threading.BoundedSemaphore(1)
+    passes = 0
+    while True:
+        if ffmpeg_executable(config):
+            for root in roots:
+                for file in media_files(root) if Path(root).is_dir() else []:
+                    try:
+                        if not thumb_path(file).is_file():
+                            render_thumbnail(file, config, limit=own, wait=60)
+                    except (OSError, ValueError, TimeoutError):
+                        continue  # Partly written or unsupported; retried next pass.
+            if passes % 120 == 0:
+                prune_thumbnails()
+            passes += 1
+        time.sleep(interval)
 
 
 def mime(path):
@@ -183,6 +261,7 @@ def parse_range(header, size):
 
 def send_local(handler, path, download=False, head=False, cache_seconds=0):
     size = path.stat().st_size
+    cache = f'private, max-age={cache_seconds}' if cache_seconds else 'no-store'
     try:
         range_value = parse_range(handler.headers.get('Range'), size)
     except ValueError:
@@ -196,7 +275,7 @@ def send_local(handler, path, download=False, head=False, cache_seconds=0):
     length = max(0, end - start + 1)
     handler.send_response(206 if range_value else 200)
     handler.send_header('Content-Type', mime(path))
-    handler.base_headers()
+    handler.base_headers(cache)
     handler.send_header('Accept-Ranges', 'bytes')
     if range_value:
         handler.send_header('Content-Range', f'bytes {start}-{end}/{size}')
